@@ -1,0 +1,37 @@
+# Place this file at .github/workflows/prices.yml in the repo.
+name: sumetra-prices
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # every 30 minutes
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+permissions:
+  contents: write # needed to push prices.json / history.json
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch prices + history
+        env:
+          CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+        run: python3 fetch.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name "sumetra-prices-bot"
+          git config user.email "prices@sumetra.org"
+          git add prices.json history.json
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "price update $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
