@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """SuMeTra Index price fetcher — runs on GitHub Actions cron.
 
-Fetches the lowest CSFloat listing for each index constituent plus Steam
-price history, and writes prices.json / history.json for sumetra.org.
+Fetches the lowest CSFloat listing for each index constituent plus CSFloat
+daily sales history, and writes prices.json / history.json for sumetra.org.
 
 Required env: CSFLOAT_API_KEY (repo secret — never committed).
 """
@@ -64,29 +64,37 @@ def csfloat_lowest(name):
         return None
 
 
-def steam_history(name):
-    """Steam price history downsampled to one point per day: [(iso, usd)]."""
-    q = urllib.parse.quote(name)
-    url = f"https://steamcommunity.com/market/pricehistory/?appid=730&market_hash_name={q}"
+def csfloat_history(name):
+    """CSFloat daily average sale prices: [(iso, usd)] ascending.
+
+    Uses the public, unauthenticated graph endpoint:
+        GET /api/v1/history/{market_hash_name}/graph
+    -> [{"count": n, "day": "2026-09-22T00:00:00Z", "avg_price": 7616}, ...]
+    (avg_price is in cents.) Returns None on failure.
+    """
+    q = urllib.parse.quote(name, safe="")
+    url = f"https://csfloat.com/api/v1/history/{q}/graph"
     try:
-        status, body = http_get(url)
+        status, body = http_get(url, timeout=45)
         if status != 200:
-            print(f"  steam history HTTP {status} for {name}", file=sys.stderr)
+            print(f"  csfloat graph HTTP {status} for {name}", file=sys.stderr)
             return None
-        pts = json.loads(body).get("prices") or []
-        by_day = {}
-        for p in pts:
+        pts = []
+        for row in json.loads(body):
             try:
-                # Steam format: "Sep 18 2026 01: +0"
-                toks = p[0].replace(":", " ").split()[:4]
-                dt = datetime.strptime(" ".join(toks), "%b %d %Y %H")
-                dt = dt.replace(tzinfo=timezone.utc)
-                by_day[dt.date().isoformat()] = (dt.isoformat(), float(p[1]))
-            except (ValueError, IndexError, TypeError):
+                usd = round(float(row["avg_price"]) / 100, 2)
+                dt = datetime.fromisoformat(
+                    row["day"].replace("Z", "+00:00")
+                )
+                pts.append(
+                    (dt.strftime("%Y-%m-%dT%H:%M:%SZ"), usd)
+                )
+            except (KeyError, ValueError, TypeError):
                 continue
-        return sorted(by_day.values())
-    except Exception as e:  # noqa: BLE001
-        print(f"  steam history error for {name}: {e}", file=sys.stderr)
+        pts.sort(key=lambda p: p[0])
+        return pts
+    except Exception as e:  # noqa: BLE001 - keep the cron green
+        print(f"  csfloat graph error for {name}: {e}", file=sys.stderr)
         return None
 
 
@@ -123,16 +131,24 @@ def main():
         )
 
     # Merge histories: keep old days, overwrite with fresh ones.
+    # Primary source is CSFloat daily sales averages. If the graph endpoint
+    # fails for an item (e.g. newer charms), fall back to recording today's
+    # lowest CSFloat listing as that day's point so history still accumulates.
     old = load_json("history.json") or {}
     old_items = old.get("items", {})
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
     merged = {}
     for name in ITEMS:
         series = {iso: usd for iso, usd in (old_items.get(name) or [])}
-        fresh = steam_history(name)
-        print(f"{'OK ' if fresh else 'MISS'} steam history | {name}")
+        fresh = csfloat_history(name)
+        print(f"{'OK ' if fresh else 'MISS'} csfloat history | {name}")
         if fresh:
             for iso, usd in fresh:
                 series[iso] = usd
+        elif prices.get(name, {}).get("usd") is not None:
+            # Fallback: today's lowest listing becomes today's history point.
+            series[today] = prices[name]["usd"]
+            print(f"  fallback: listing snapshot for {name}")
         merged[name] = sorted(series.items())
         time.sleep(2)
 
